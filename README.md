@@ -1,249 +1,393 @@
-# Step-by-step VPS hardening tutorial
+# Self-hosting step-by-step tutorial (Caddy, DNS, static sites, reverse proxy, PM2)
 
-Nice — below is a compact, practical checklist and commands you can run **now** to lock down a brand-new Ubuntu VPS. I’ve kept it ordered so you can follow one step at a time. Read each step before you run commands and **keep a fallback session** (or console access from your VPS provider) open while changing SSH settings so you don’t accidentally lock yourself out.
+Below I converted your multi-part guide into a compact, actionable step-by-step tutorial you can follow. Copy & paste commands on the server (adjust usernames, domains, and IPs). I kept important notes and warnings inline so you don’t accidentally lock yourself out.
 
 ---
 
-## 1) Connect and update the system
+# Part 0 — Prerequisites & quick checklist
 
-1. SSH into your VPS:
+* You have a VPS (Ubuntu/Debian recommended) and its public IP.
+* You have a domain name and access to its DNS management (registrar or Cloudflare).
+* You have a non-root local SSH user (we’ll use `cj` in examples).
+* Firewall: make sure ports **80** and **443** will be allowed (UFW or provider firewall).
+* Important: if using Cloudflare, **disable the orange proxy** for any host Caddy should provision certificates for (grey cloud).
+
+---
+
+# Part 1 — DNS (map names → your server IP)
+
+1. Log into your registrar or Cloudflare.
+2. Create A records pointing to your server IP (set **TTL low** while testing — e.g. 60s):
+
+   * `@` → `YOUR.SERVER.IP` (root / apex domain)
+   * `www` → `YOUR.SERVER.IP`
+   * `holidays` → `YOUR.SERVER.IP` (example subdomain)
+3. **If using Cloudflare**: set proxy to **off** (grey cloud). Caddy needs direct connections for TLS issuance.
+4. Verify with `dig` from your terminal:
 
 ```bash
-ssh root@YOUR_SERVER_IP
+dig +short notlocalhost.net
+dig +short www.notlocalhost.net
+dig +short holidays.notlocalhost.net
 ```
 
-2. Refresh package lists and upgrade everything:
+(wait TTL seconds after creating records if needed)
+
+---
+
+# Part 2 — Install Caddy as a system service (automatic HTTPS)
+
+1. Install Caddy (Debian/Ubuntu):
 
 ```bash
+sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+  | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.txt' \
+  | sudo tee /etc/apt/sources.list.d/caddy-stable.list
 sudo apt update
-sudo apt upgrade -y
+sudo apt install -y caddy
 ```
 
-3. If kernel updated, check if reboot required:
+2. Verify the service:
 
 ```bash
-[ -f /var/run/reboot-required ] && echo "REBOOT REQUIRED"
+sudo service caddy status
+caddy version
 ```
 
-If required, reboot (use provider console if you prefer):
+3. Create a sites organization for maintainability:
 
 ```bash
-sudo reboot
+sudo mkdir -p /etc/caddy/sites-available /etc/caddy/sites-enabled
+sudo chown root:root /etc/caddy/sites-available /etc/caddy/sites-enabled
+```
+
+4. Edit main Caddyfile to import enabled sites:
+
+```bash
+sudo nano /etc/caddy/Caddyfile
+```
+
+Replace/ensure it contains:
+
+```caddy
+# /etc/caddy/Caddyfile
+notlocalhost.net {
+    root * /usr/share/caddy
+    file_server
+}
+
+import sites-enabled/*
+```
+
+5. Prefer **reload** (zero-downtime) when applying changes:
+
+```bash
+sudo service caddy reload
+```
+
+(You can use `restart` while testing, but `reload` is recommended once running multiple sites.)
+
+---
+
+# Part 3 — Redirects: force HTTPS & canonical domain
+
+1. Create a redirect site file:
+
+```bash
+sudo nano /etc/caddy/sites-available/http-redirects
+```
+
+Contents:
+
+```caddy
+:80, www.notlocalhost.net {
+    # redirect any HTTP or www request to canonical HTTPS domain
+    redir https://notlocalhost.net{uri}
+}
+```
+
+2. Enable it:
+
+```bash
+sudo ln -s /etc/caddy/sites-available/http-redirects /etc/caddy/sites-enabled/http-redirects
+sudo service caddy reload
 ```
 
 ---
 
-## 2) Create a non-root user + give sudo
+# Part 4 — Serve a static website (fileserver)
 
-1. Add a regular user (replace `alice`):
+1. Create directories and set ownership (replace user `cj`):
 
 ```bash
-sudo adduser alice
+sudo mkdir -p /var/www/notlocalhost.net
+sudo chown cj:cj /var/www/notlocalhost.net
+sudo chmod 755 /var/www/notlocalhost.net
 ```
 
-2. Add that user to the `sudo` group:
+2. Update the main Caddy site block to point at the new root:
 
-```bash
-sudo usermod -aG sudo alice
+```caddy
+# in /etc/caddy/Caddyfile
+notlocalhost.net {
+    root * /var/www/notlocalhost.net
+    file_server
+    # SPA support (if needed): try_files {path} {path}/ /index.html
+}
 ```
 
-3. Verify groups:
+3. Transfer site files (from local machine) — examples:
+
+* SCP:
 
 ```bash
-groups alice
-id alice
+scp -r ./site/* cj@notlocalhost.net:/var/www/notlocalhost.net/
 ```
 
-4. Test by logging in as that user from another terminal:
+* rsync (efficient incremental sync):
 
 ```bash
-ssh alice@YOUR_SERVER_IP
-# then try:
-sudo whoami   # should print 'root' after you enter alice's password
+rsync -avzP ./site/ cj@notlocalhost.net:/var/www/notlocalhost.net/
+```
+
+* Git (public repo):
+
+```bash
+# on server as cj in an empty target directory
+git clone https://github.com/you/repo.git /var/www/notlocalhost.net
+```
+
+4. Prevent exposing `.git` or other sensitive folders — use `hide` in file_server:
+
+```caddy
+notlocalhost.net {
+    root * /var/www/notlocalhost.net
+    file_server {
+        hide .git
+    }
+    handle_errors {
+        respond "{status} {status_text}"
+    }
+}
+```
+
+5. Reload Caddy:
+
+```bash
+sudo service caddy reload
 ```
 
 ---
 
-## 3) Generate SSH keypair (on *your local machine*) and install the public key
+# Part 5 — Reverse proxy a dynamic app (example: Node.js API)
 
-On your **local** computer (not the VPS):
+## A — Open ports
 
-```bash
-# generate modern ED25519 key
-ssh-keygen -t ed25519 -C "your_email@example.com"
-# default locations (~/.ssh/id_ed25519 and id_ed25519.pub)
-```
-
-Copy your public key to the VPS (recommended):
+Make sure ports 80/443 allowed (UFW example):
 
 ```bash
-# either:
-ssh-copy-id alice@YOUR_SERVER_IP
-
-# or manual (if ssh-copy-id unavailable)
-cat ~/.ssh/id_ed25519.pub | ssh alice@YOUR_SERVER_IP "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys"
-```
-
-Quick check: log out and back in; password should not be required:
-
-```bash
-ssh alice@YOUR_SERVER_IP
-```
-
----
-
-## 4) Disable SSH password authentication and root SSH login (DON’T do this until your SSH key test works)
-
-**Important:** keep an active root or provider console session until you confirm key login works for your non-root user.
-
-Edit SSH daemon config:
-
-```bash
-sudo nano /etc/ssh/sshd_config
-```
-
-Make these changes (uncomment / set accordingly):
-
-```
-PasswordAuthentication no
-ChallengeResponseAuthentication no
-PermitRootLogin no
-# (Optional) To change SSH port: Port 2222
-```
-
-Save and exit. Then restart SSH:
-
-```bash
-sudo systemctl restart sshd
-```
-
-Test from another terminal first (do not close working session yet):
-
-```bash
-ssh alice@YOUR_SERVER_IP     # should succeed using key
-ssh root@YOUR_SERVER_IP      # should be denied
-```
-
-If you changed the port, remember to specify it: `ssh -p 2222 alice@IP`.
-
----
-
-## 5) Firewall (UFW) basics — block everything except what you need
-
-1. Set safe defaults, allow SSH and enable UFW:
-
-```bash
+sudo apt install ufw -y
 sudo ufw default deny incoming
 sudo ufw default allow outgoing
-sudo ufw allow OpenSSH     # or sudo ufw allow 2222/tcp if you changed SSH port
-sudo ufw enable
-sudo ufw status verbose
-```
-
-2. If you need a webserver later:
-
-```bash
+sudo ufw allow OpenSSH
 sudo ufw allow 80/tcp
 sudo ufw allow 443/tcp
-```
-
-3. To restrict SSH to a single IP (if you have a static IP):
-
-```bash
-sudo ufw delete allow OpenSSH
-sudo ufw allow from 203.0.113.45 to any port 22 proto tcp
-```
-
-(Replace `203.0.113.45` with your IP and port with your SSH port.)
-
----
-
-## 6) Automatic security updates
-
-Install and enable unattended upgrades:
-
-```bash
-sudo apt install unattended-upgrades -y
-sudo dpkg-reconfigure --priority=low unattended-upgrades
-```
-
-You can tweak `/etc/apt/apt.conf.d/50unattended-upgrades` to control which packages are auto-updated and whether the server auto-reboots:
-
-```bash
-sudo nano /etc/apt/apt.conf.d/50unattended-upgrades
-```
-
----
-
-## 7) Add extra protections (recommended)
-
-* **Fail2ban** — blocks IPs that fail authentication repeatedly:
-
-```bash
-sudo apt install fail2ban -y
-# basic service will work; edit /etc/fail2ban/jail.local to customize
-```
-
-* **Disable unused services**: list listening ports and stop services you don't need:
-
-```bash
-sudo ss -tuln     # shows listening TCP/UDP ports
-sudo systemctl disable --now SERVICE_NAME
-```
-
-* **Install and use a reverse proxy / TLS** later (nginx/caddy) for web apps.
-
----
-
-## 8) Hardening checklist & safety notes
-
-* ✅ Confirm key login for `alice` **before** disabling password auth.
-* ✅ Do **not** close your active root/provider console session until SSH changes verified.
-* ✅ Keep at least one sudo user with key access.
-* ✅ Monitor logs: `sudo tail -f /var/log/auth.log`
-* ✅ Consider using 2FA for control panels, and keep backups of critical configs and keys.
-* ✅ Regularly run `sudo apt update && sudo apt upgrade -y`.
-
----
-
-## Useful commands summary
-
-```bash
-# system updates
-sudo apt update && sudo apt upgrade -y
-
-# create user and give sudo
-sudo adduser alice
-sudo usermod -aG sudo alice
-
-# ssh key copy (from local machine)
-ssh-copy-id alice@SERVER_IP
-
-# check open ports
-sudo ss -tuln
-
-# enable ufw firewall
-sudo ufw default deny incoming
-sudo ufw allow OpenSSH
 sudo ufw enable
+sudo ufw status
+```
 
-# install fail2ban
-sudo apt install fail2ban -y
+## B — Install Node.js (NVM) as non-root user
 
-# unattended upgrades
-sudo apt install unattended-upgrades -y
-sudo dpkg-reconfigure --priority=low unattended-upgrades
+Run as the non-root user (cj):
 
-# restart sshd
-sudo systemctl restart sshd
+```bash
+# install NVM
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+source ~/.bashrc
+
+# install latest LTS
+nvm install --lts
+node -v
+npm -v
+```
+
+## C — Clone app (private repo: use deploy key; public repo: HTTPS)
+
+* **Public repo** example (as `cj`):
+
+```bash
+mkdir -p ~/hosts
+git clone https://github.com/you/holidays.git ~/hosts/holidays
+cd ~/hosts/holidays
+npm install
+# copy .env from example and set values
+cp .env.sample .env
+# start locally for test
+npm start
+```
+
+* **Private repo (recommended)**: create a **deploy key**:
+
+  1. On the **server** (cj user), generate an SSH key pair with a unique name:
+
+  ```bash
+  ssh-keygen -t ed25519 -C "deploy@notlocalhost" -f ~/.ssh/deploy_holidays -N ""
+  ```
+
+  2. Copy the public key `~/.ssh/deploy_holidays.pub` and add it to the GitHub repo under **Settings → Deploy keys** (read-only).
+  3. Clone via SSH:
+
+  ```bash
+  GIT_SSH_COMMAND='ssh -i ~/.ssh/deploy_holidays' git clone git@github.com:you/holidays.git ~/hosts/holidays
+  ```
+
+## D — Configure Caddy reverse proxy for the subdomain
+
+Create `/etc/caddy/sites-available/holidays-api`:
+
+```caddy
+holidays.notlocalhost.net {
+    reverse_proxy localhost:5000
+    handle_errors {
+        respond "{status} {status_text}"
+    }
+    log {
+        output file /var/log/caddy/holidays.access.log
+    }
+}
+```
+
+Enable and reload:
+
+```bash
+sudo ln -s /etc/caddy/sites-available/holidays-api /etc/caddy/sites-enabled/holidays-api
+sudo mkdir -p /var/log/caddy
+sudo chown caddy:caddy /var/log/caddy
+sudo service caddy reload
 ```
 
 ---
 
-## Final notes
+# Part 6 — Keep the app running: PM2 (recommended for Node)
 
-* Changing the SSH port or disabling password login reduces *automated* brute-force attempts drastically — but **always** verify connectivity first.
-* Keep a provider console (VPS web UI) access method available in case of mistakes.
-* Next steps you might want: set up `fail2ban` rules, configure `nginx`/`caddy` with TLS, or run services in Docker with limited privileges. If you want, I can generate a short script to apply the safe defaults above (with prompts), or produce a walkthrough video script based on this tutorial.
+1. Install PM2 (as `cj`):
 
-Want that script or an automated checklist file (bash)?
+```bash
+npm install -g pm2
+```
+
+2. Start the app with PM2 (from project folder):
+
+```bash
+cd ~/hosts/holidays
+pm2 start npm --name "holidays-api" -- start     # or pm2 start dist/index.js --name holidays-api
+pm2 list
+```
+
+3. Enable startup on reboot (PM2→systemd):
+
+```bash
+pm2 startup
+# follow printed command (run it with sudo)
+pm2 save
+```
+
+4. Manage logs:
+
+```bash
+pm2 logs holidays-api
+pm2 stop holidays-api
+pm2 restart holidays-api
+pm2 delete holidays-api
+```
+
+---
+
+# Part 7 — Build pipelines / apps that require a build step
+
+* For TypeScript/compiled backends: `npm run build` → run the built `dist` files with PM2.
+* For frontend frameworks (Vite, CRA): run `npm run build` → serve the generated `dist`/`build` folder with the static file server at `/var/www/...`.
+
+Example: build & serve
+
+```bash
+# in project root (on server or CI)
+npm install
+npm run build
+
+# copy/build output to /var/www/site
+rsync -avz build/ cj@notlocalhost.net:/var/www/bigtimer/
+# configure caddy root to /var/www/bigtimer
+```
+
+---
+
+# Part 8 — Logging & error handling (Caddy snippets)
+
+* Add structured access logs and simple error responses in site blocks:
+
+```caddy
+log {
+    output file /var/log/caddy/access.log {
+        roll_size 50mb
+        roll_keep 5
+        roll_keep_for 720h
+    }
+}
+
+handle_errors {
+    respond "{status} {status_text}"
+}
+```
+
+(Place these inside the relevant site blocks or in included files.)
+
+---
+
+# Part 9 — Good practices & security notes
+
+* **Disable Cloudflare proxy** for any domain Caddy will manage TLS for.
+* Always **verify SSH key login** for your non-root user before disabling password auth or root login.
+* Keep filesystem perms tight:
+
+  * Site files: `owner=cj`, `group=cj`, `chmod 755` for dirs and `644` for files.
+  * Don’t make site folders writable by the webserver user.
+* Use `sudo service caddy reload` to apply config changes with no downtime.
+* Use `unattended-upgrades` and `fail2ban` to reduce attack surface.
+* Use deploy keys for private repos (one deploy key per repo) instead of adding the VPS key to your main GitHub account.
+* Monitor `sudo tail -f /var/log/auth.log`, `pm2 logs`, and Caddy logs in `/var/log/caddy`.
+
+---
+
+# Quick command summary (copy-paste)
+
+```bash
+# Caddy install (Ubuntu)
+sudo apt update
+# (follow Caddy install block above)
+
+# Create site folders
+sudo mkdir -p /var/www/notlocalhost.net
+sudo chown cj:cj /var/www/notlocalhost.net
+sudo chmod 755 /var/www/notlocalhost.net
+
+# Enable a site
+sudo ln -s /etc/caddy/sites-available/holidays-api /etc/caddy/sites-enabled/holidays-api
+sudo service caddy reload
+
+# Install NVM & Node (as cj)
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+source ~/.bashrc
+nvm install --lts
+
+# PM2
+npm install -g pm2
+pm2 start npm --name "holidays-api" -- start
+pm2 startup
+pm2 save
+```
+
+---
+
