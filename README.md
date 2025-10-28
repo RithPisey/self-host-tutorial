@@ -1,249 +1,265 @@
-# Step-by-step VPS hardening tutorial
+Of course\! Deploying Laravel with Docker and using Caddy as a reverse proxy is a powerful and modern setup. Here's a step-by-step guide to get you up and running.
+
+This approach will create a shared database container and then a separate, self-contained environment for each of your Laravel applications.
+
+-----
+
+### \#\# 1. Setting Up the Shared MariaDB Service  DATABASE
+
+First, let's create a shared Docker network and launch the MariaDB container. This ensures all your Laravel applications can communicate with the same database instance securely.
+
+1.  **Create a Docker Network:** This network will be used by MariaDB and all your future Laravel app containers.
+
+    ```bash
+    docker network create shared-services
+    ```
+
+2.  **Create a Directory for MariaDB Data:** We need to store the database data on the host machine so it persists even if the container is removed.
+
+    ```bash
+    # Create a directory to hold all your docker volumes
+    sudo mkdir -p /opt/docker/mariadb/data
+    ```
+
+3.  **Create a `docker-compose.yml` for MariaDB:** In a convenient location (like `/opt/docker/mariadb/`), create a file named `docker-compose.yml`:
 
-Nice — below is a compact, practical checklist and commands you can run **now** to lock down a brand-new Ubuntu VPS. I’ve kept it ordered so you can follow one step at a time. Read each step before you run commands and **keep a fallback session** (or console access from your VPS provider) open while changing SSH settings so you don’t accidentally lock yourself out.
+    ```yaml
+    version: '3.8'
 
----
+    services:
+      mariadb:
+        image: mariadb:11.2 # Using a specific version is good practice
+        container_name: global-mariadb
+        restart: unless-stopped
+        environment:
+          # IMPORTANT: Change these values!
+          MARIADB_ROOT_PASSWORD: 'your_strong_root_password'
+          MARIADB_DATABASE: 'your_first_laravel_db'
+          MARIADB_USER: 'your_laravel_user'
+          MARIADB_PASSWORD: 'your_strong_user_password'
+        volumes:
+          - ./data:/var/lib/mysql
+        networks:
+          - shared-services
+        # DO NOT expose ports to the public internet unless you have a specific need.
+        # Containers on the same network can communicate directly.
+
+    networks:
+      shared-services:
+        external: true
+    ```
+
+4.  **Launch MariaDB:** Navigate to the directory containing this `docker-compose.yml` file and run:
+
+    ```bash
+    cd /opt/docker/mariadb
+    docker compose up -d
+    ```
+
+Your shared MariaDB database is now running\! You can connect to it from any other container attached to the `shared-services` network using the hostname **`global-mariadb`**.
+
+-----
+
+### \#\# 2. Dockerizing Your Laravel Application 🚀
+
+Now, for each Laravel project, you'll need to add a couple of files to "dockerize" it. Navigate to the root directory of one of your Laravel projects.
+
+1.  **Create a `Dockerfile`:** This file defines the steps to build your application's image. It will use a multi-stage build to keep the final image lean, handling both the Node.js asset compilation and the PHP environment.
+
+    Create a file named `Dockerfile` in your Laravel project's root:
+
+    ```dockerfile
+    # Stage 1: Build Node.js assets
+    FROM node:22-alpine AS builder
+    WORKDIR /app
+    COPY package*.json ./
+    RUN npm install
+    COPY . .
+    # This command compiles your Vue/Inertia assets for production
+    RUN npm run build
+
+    # Stage 2: Create the final PHP production image
+    FROM php:8.3-fpm-alpine AS final
+    WORKDIR /var/www/html
+
+    # Install system dependencies
+    RUN apk add --no-cache \
+        libzip-dev \
+        zip \
+        oniguruma-dev \
+        libxml2-dev
+
+    # Install common PHP extensions for Laravel
+    RUN docker-php-ext-install \
+        pdo_mysql \
+        bcmath \
+        pcntl \
+        exif \
+        zip \
+        mbstring \
+        gd \
+        xml \
+        sockets
+
+    # Install Composer
+    COPY --from=composer/latest /usr/bin/composer /usr/bin/composer
+
+    # Copy application code and compiled assets from the builder stage
+    COPY --from=builder /app /var/www/html
 
-## 1) Connect and update the system
+    # Install Composer dependencies
+    RUN composer install --no-interaction --optimize-autoloader --no-dev
 
-1. SSH into your VPS:
+    # Set correct permissions for storage and cache
+    RUN chown -R www-data:www-data /var/www/html/storage /var/www/html/bootstrap/cache
+    RUN chmod -R 775 /var/www/html/storage /var/www/html/bootstrap/cache
 
-```bash
-ssh root@YOUR_SERVER_IP
-```
+    # Expose port 9000 for PHP-FPM
+    EXPOSE 9000
 
-2. Refresh package lists and upgrade everything:
+    # Start PHP-FPM
+    CMD ["php-fpm"]
+    ```
 
-```bash
-sudo apt update
-sudo apt upgrade -y
-```
+2.  **Create a `.dockerignore` file:** This prevents unnecessary files from being copied into your Docker image, making the build process faster and the image smaller.
 
-3. If kernel updated, check if reboot required:
+    ```
+    .git
+    .github
+    .env
+    .env.example
+    node_modules
+    vendor
+    storage
+    public/storage
+    docker-compose.yml
+    Dockerfile
+    README.md
+    ```
 
-```bash
-[ -f /var/run/reboot-required ] && echo "REBOOT REQUIRED"
-```
+3.  **Create a `docker-compose.yml` for the App:** This file will manage your application's service. Create a `docker-compose.yml` in the project root:
 
-If required, reboot (use provider console if you prefer):
+    ```yaml
+    version: '3.8'
 
-```bash
-sudo reboot
-```
+    services:
+      app:
+        build: . # Tells Docker to build the Dockerfile in the current directory
+        container_name: my-first-app # Give each app a unique container name
+        restart: unless-stopped
+        volumes:
+          # Mount the .env file from the host into the container
+          - ./.env:/var/www/html/.env
+        networks:
+          - shared-services
+        # Map container's port 9000 to host's port 9001 (use a different host port for each app)
+        ports:
+          - "127.0.0.1:9001:9000"
 
----
+    networks:
+      shared-services:
+        external: true
+    ```
 
-## 2) Create a non-root user + give sudo
+    **Note:** For your second Laravel app, you would change `container_name` to `my-second-app` and the port mapping to `"127.0.0.1:9002:9000"`, and so on.
 
-1. Add a regular user (replace `alice`):
+-----
 
-```bash
-sudo adduser alice
-```
+### \#\# 3. Configuring Caddy as a Reverse Proxy 🔗
 
-2. Add that user to the `sudo` group:
+Caddy, which is already installed on your host OS, will act as the web server. It will serve static files directly and forward PHP requests to the correct Docker container.
 
-```bash
-sudo usermod -aG sudo alice
-```
+1.  **Edit your `Caddyfile`:** This is typically located at `/etc/caddy/Caddyfile`.
 
-3. Verify groups:
+2.  **Add a new site block for your application:**
 
-```bash
-groups alice
-id alice
-```
+    ```caddy
+    # Add this block for your first Laravel application
+    your-domain.com {
+        # Set the web root to your project's public directory on the host
+        root * /path/to/your/laravel/project/public
 
-4. Test by logging in as that user from another terminal:
+        # Enable compression
+        encode zstd gzip
 
-```bash
-ssh alice@YOUR_SERVER_IP
-# then try:
-sudo whoami   # should print 'root' after you enter alice's password
-```
+        # Handle PHP requests by forwarding them to the app container's mapped port
+        # This points to localhost:9001, which we mapped in the app's docker-compose.yml
+        php_fastcgi 127.0.0.1:9001
 
----
+        # Serve static files directly
+        file_server
 
-## 3) Generate SSH keypair (on *your local machine*) and install the public key
+        # Rewrite all other requests to index.php for Laravel's front-controller
+        try_files {path} {path}/ /index.php?{query}
+    }
 
-On your **local** computer (not the VPS):
+    # For a second application, you would add another block:
+    # another-domain.com {
+    #     root * /path/to/your/second/laravel/project/public
+    #     php_fastcgi 127.0.0.1:9002 # Points to the second app's mapped port
+    #     # ... same file_server and try_files config
+    # }
+    ```
 
-```bash
-# generate modern ED25519 key
-ssh-keygen -t ed25519 -C "your_email@example.com"
-# default locations (~/.ssh/id_ed25519 and id_ed25519.pub)
-```
+    Caddy will automatically handle provisioning and renewing SSL certificates for `your-domain.com`.
 
-Copy your public key to the VPS (recommended):
+3.  **Reload Caddy:** After saving your `Caddyfile`, apply the changes.
 
-```bash
-# either:
-ssh-copy-id alice@YOUR_SERVER_IP
+    ```bash
+    sudo systemctl reload caddy
+    ```
 
-# or manual (if ssh-copy-id unavailable)
-cat ~/.ssh/id_ed25519.pub | ssh alice@YOUR_SERVER_IP "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys"
-```
+-----
 
-Quick check: log out and back in; password should not be required:
+### \#\# 4. Deployment Workflow Summary ✅
 
-```bash
-ssh alice@YOUR_SERVER_IP
-```
+Here is the complete workflow to deploy a new Laravel application:
 
----
+1.  **Clone Your Project:** Clone your Laravel application from your git repository onto your VPS (e.g., into `/var/www/my-first-app`).
 
-## 4) Disable SSH password authentication and root SSH login (DON’T do this until your SSH key test works)
+    ```bash
+    cd /var/www
+    git clone your-repository-url.git my-first-app
+    cd my-first-app
+    ```
 
-**Important:** keep an active root or provider console session until you confirm key login works for your non-root user.
+2.  **Add Docker Files:** Add the `Dockerfile`, `.dockerignore`, and `docker-compose.yml` files as described in Step 2.
 
-Edit SSH daemon config:
+3.  **Configure `.env` file:** Copy `.env.example` to `.env` and configure it for production.
 
-```bash
-sudo nano /etc/ssh/sshd_config
-```
+    ```bash
+    cp .env.example .env
+    nano .env
+    ```
 
-Make these changes (uncomment / set accordingly):
+    **Most importantly**, set your database connection details:
 
-```
-PasswordAuthentication no
-ChallengeResponseAuthentication no
-PermitRootLogin no
-# (Optional) To change SSH port: Port 2222
-```
+    ```env
+    DB_CONNECTION=mysql
+    DB_HOST=global-mariadb  # <-- Use the container name
+    DB_PORT=3306
+    DB_DATABASE=your_first_laravel_db # The DB you created in Step 1
+    DB_USERNAME=your_laravel_user   # The user you created in Step 1
+    DB_PASSWORD=your_strong_user_password # The password you set in Step 1
+    ```
 
-Save and exit. Then restart SSH:
+4.  **Build and Run the Container:**
 
-```bash
-sudo systemctl restart sshd
-```
+    ```bash
+    docker compose up -d --build
+    ```
 
-Test from another terminal first (do not close working session yet):
+5.  **Run Final Commands:** Execute database migrations and other necessary Artisan commands inside the container.
 
-```bash
-ssh alice@YOUR_SERVER_IP     # should succeed using key
-ssh root@YOUR_SERVER_IP      # should be denied
-```
+    ```bash
+    docker compose exec app php artisan key:generate
+    docker compose exec app php artisan storage:link
+    docker compose exec app php artisan migrate --seed # optional
+    docker compose exec app php artisan config:cache
+    docker compose exec app php artisan route:cache
+    docker compose exec app php artisan view:cache
+    ```
 
-If you changed the port, remember to specify it: `ssh -p 2222 alice@IP`.
+6.  **Configure and Reload Caddy:** Add the site block to your `Caddyfile` and reload the Caddy service as shown in Step 3.
 
----
-
-## 5) Firewall (UFW) basics — block everything except what you need
-
-1. Set safe defaults, allow SSH and enable UFW:
-
-```bash
-sudo ufw default deny incoming
-sudo ufw default allow outgoing
-sudo ufw allow OpenSSH     # or sudo ufw allow 2222/tcp if you changed SSH port
-sudo ufw enable
-sudo ufw status verbose
-```
-
-2. If you need a webserver later:
-
-```bash
-sudo ufw allow 80/tcp
-sudo ufw allow 443/tcp
-```
-
-3. To restrict SSH to a single IP (if you have a static IP):
-
-```bash
-sudo ufw delete allow OpenSSH
-sudo ufw allow from 203.0.113.45 to any port 22 proto tcp
-```
-
-(Replace `203.0.113.45` with your IP and port with your SSH port.)
-
----
-
-## 6) Automatic security updates
-
-Install and enable unattended upgrades:
-
-```bash
-sudo apt install unattended-upgrades -y
-sudo dpkg-reconfigure --priority=low unattended-upgrades
-```
-
-You can tweak `/etc/apt/apt.conf.d/50unattended-upgrades` to control which packages are auto-updated and whether the server auto-reboots:
-
-```bash
-sudo nano /etc/apt/apt.conf.d/50unattended-upgrades
-```
-
----
-
-## 7) Add extra protections (recommended)
-
-* **Fail2ban** — blocks IPs that fail authentication repeatedly:
-
-```bash
-sudo apt install fail2ban -y
-# basic service will work; edit /etc/fail2ban/jail.local to customize
-```
-
-* **Disable unused services**: list listening ports and stop services you don't need:
-
-```bash
-sudo ss -tuln     # shows listening TCP/UDP ports
-sudo systemctl disable --now SERVICE_NAME
-```
-
-* **Install and use a reverse proxy / TLS** later (nginx/caddy) for web apps.
-
----
-
-## 8) Hardening checklist & safety notes
-
-* ✅ Confirm key login for `alice` **before** disabling password auth.
-* ✅ Do **not** close your active root/provider console session until SSH changes verified.
-* ✅ Keep at least one sudo user with key access.
-* ✅ Monitor logs: `sudo tail -f /var/log/auth.log`
-* ✅ Consider using 2FA for control panels, and keep backups of critical configs and keys.
-* ✅ Regularly run `sudo apt update && sudo apt upgrade -y`.
-
----
-
-## Useful commands summary
-
-```bash
-# system updates
-sudo apt update && sudo apt upgrade -y
-
-# create user and give sudo
-sudo adduser alice
-sudo usermod -aG sudo alice
-
-# ssh key copy (from local machine)
-ssh-copy-id alice@SERVER_IP
-
-# check open ports
-sudo ss -tuln
-
-# enable ufw firewall
-sudo ufw default deny incoming
-sudo ufw allow OpenSSH
-sudo ufw enable
-
-# install fail2ban
-sudo apt install fail2ban -y
-
-# unattended upgrades
-sudo apt install unattended-upgrades -y
-sudo dpkg-reconfigure --priority=low unattended-upgrades
-
-# restart sshd
-sudo systemctl restart sshd
-```
-
----
-
-## Final notes
-
-* Changing the SSH port or disabling password login reduces *automated* brute-force attempts drastically — but **always** verify connectivity first.
-* Keep a provider console (VPS web UI) access method available in case of mistakes.
-* Next steps you might want: set up `fail2ban` rules, configure `nginx`/`caddy` with TLS, or run services in Docker with limited privileges. If you want, I can generate a short script to apply the safe defaults above (with prompts), or produce a walkthrough video script based on this tutorial.
-
-Want that script or an automated checklist file (bash)?
+That's it\! Your Laravel application is now running in Docker, served securely by Caddy. You can repeat steps 2 through 4 for each additional Laravel application you want to deploy.
