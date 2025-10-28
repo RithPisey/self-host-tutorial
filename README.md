@@ -69,56 +69,67 @@ Now, for each Laravel project, you'll need to add a couple of files to "dockeriz
     Create a file named `Dockerfile` in your Laravel project's root:
 
     ```dockerfile
-    # Stage 1: Build Node.js assets
-    FROM node:22-alpine AS builder
-    WORKDIR /app
-    COPY package*.json ./
-    RUN npm install
-    COPY . .
-    # This command compiles your Vue/Inertia assets for production
-    RUN npm run build
+        # Stage 1: Build Node.js assets
+        FROM node:22-alpine AS builder
+        WORKDIR /app
+        COPY package*.json ./
+        RUN npm install
+        COPY . .
+        # This command compiles your Vue/Inertia assets for production
+        RUN npm run build
+        
+        # Stage 2: Create the final PHP production image
+        FROM php:8.3-fpm-alpine AS final
+        WORKDIR /var/www/html
+        
+        # Install system dependencies
+        # ADDED freetype-dev, libjpeg-turbo-dev, and libpng-dev for the 'gd' extension
+        RUN apk add --no-cache \
+            libzip-dev \
+            zip \
+            oniguruma-dev \
+            libxml2-dev \
+            freetype-dev \
+            libjpeg-turbo-dev \
+            libpng-dev
+        
+        # Install common PHP extensions for Laravel
+        # Install common PHP extensions, removing all that are already built-in
+        RUN docker-php-ext-install \
+            pdo_mysql \
+            bcmath \
+            pcntl \
+            exif \
+            zip \
+            gd
+        
+        # ... the rest of your Dockerfile continues here
+        
+        # Install Composer
+        COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
+        
+        # Copy application code and compiled assets from the builder stage
+        COPY --from=builder /app /var/www/html
+        
+        # Create the cache directory and set permissions BEFORE running composer
+        RUN mkdir -p /var/www/html/bootstrap/cache \
+            && mkdir -p /var/www/html/storage/framework/views \
+            && chown -R www-data:www-data /var/www/html/storage /var/www/html/bootstrap/cache \
+            && chmod -R 775 /var/www/html/storage /var/www/html/bootstrap/cache
+        
+        # Install Composer dependencies
+        RUN composer install --no-interaction --optimize-autoloader --no-dev
+        
+        # Set correct permissions for storage (cache is already done)
+        RUN chown -R www-data:www-data /var/www/html/storage && \
+            chmod -R 775 /var/www/html/storage
+        
+        # Expose port 9000 for PHP-FPM
+        EXPOSE 9000
+        
+        # Start PHP-FPM
+        CMD ["php-fpm"]
 
-    # Stage 2: Create the final PHP production image
-    FROM php:8.3-fpm-alpine AS final
-    WORKDIR /var/www/html
-
-    # Install system dependencies
-    RUN apk add --no-cache \
-        libzip-dev \
-        zip \
-        oniguruma-dev \
-        libxml2-dev
-
-    # Install common PHP extensions for Laravel
-    RUN docker-php-ext-install \
-        pdo_mysql \
-        bcmath \
-        pcntl \
-        exif \
-        zip \
-        mbstring \
-        gd \
-        xml \
-        sockets
-
-    # Install Composer
-    COPY --from=composer/latest /usr/bin/composer /usr/bin/composer
-
-    # Copy application code and compiled assets from the builder stage
-    COPY --from=builder /app /var/www/html
-
-    # Install Composer dependencies
-    RUN composer install --no-interaction --optimize-autoloader --no-dev
-
-    # Set correct permissions for storage and cache
-    RUN chown -R www-data:www-data /var/www/html/storage /var/www/html/bootstrap/cache
-    RUN chmod -R 775 /var/www/html/storage /var/www/html/bootstrap/cache
-
-    # Expose port 9000 for PHP-FPM
-    EXPOSE 9000
-
-    # Start PHP-FPM
-    CMD ["php-fpm"]
     ```
 
 2.  **Create a `.dockerignore` file:** This prevents unnecessary files from being copied into your Docker image, making the build process faster and the image smaller.
@@ -252,12 +263,12 @@ Here is the complete workflow to deploy a new Laravel application:
 5.  **Run Final Commands:** Execute database migrations and other necessary Artisan commands inside the container.
 
     ```bash
-    docker compose exec app php artisan key:generate
-    docker compose exec app php artisan storage:link
-    docker compose exec app php artisan migrate --seed # optional
-    docker compose exec app php artisan config:cache
-    docker compose exec app php artisan route:cache
-    docker compose exec app php artisan view:cache
+    docker compose exec --user root app php artisan key:generate
+    docker compose exec --user root app php artisan storage:link
+    docker compose exec --user root app php artisan migrate --seed # optional
+    docker compose exec --user root app php artisan config:cache
+    docker compose exec --user root app php artisan route:cache
+    docker compose exec --user root app php artisan view:cache
     ```
 
 6.  **Configure and Reload Caddy:** Add the site block to your `Caddyfile` and reload the Caddy service as shown in Step 3.
