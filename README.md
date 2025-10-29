@@ -96,73 +96,71 @@ cd /home/dit/my-laravel-app
 
     ```dockerfile
     
-    # Base PHP 8.3 FPM image
-    FROM php:8.3-fpm
-    
-    # Set working directory
-    WORKDIR /var/www
-    
-    # Install system dependencies
-    RUN apt-get update && apt-get install -y \
-        git \
-        curl \
-        libpng-dev \
-        libonig-dev \
-        libxml2-dev \
-        zip \
-        unzip \
-        libzip-dev \
-        libjpeg-dev \
-        libfreetype6-dev \
-        nodejs \
-        npm
-    
-    # Install PHP extensions required by Laravel
-    RUN docker-php-ext-install pdo_mysql mbstring exif pcntl bcmath gd zip
-    
-    # Clear cache
-    RUN apt-get clean && rm -rf /var/lib/apt/lists/*
-    
-    # Install Composer
-    COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
-    
-    # Install Node.js v22 (the default nodejs might be older)
-    RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-    RUN apt-get install -y nodejs
-    
-    
-    
-    # Copy composer.json and composer.lock
-    COPY composer.json composer.lock ./
-    
-    # Create the cache directory and set permissions BEFORE running composer
-    RUN mkdir -p /var/www/bootstrap/cache \
-        && mkdir -p /var/www/storage/framework/views \
-        && chown -R www-data:www-data /var/www/storage /var/www/bootstrap/cache \
-        && chmod -R 775 /var/www/storage /var/www/bootstrap/cache
-    
-    
-    # Install composer dependencies
-    RUN composer install --no-interaction --no-plugins --no-scripts --prefer-dist
-    
-    # Copy package.json and package-lock.json
-    COPY package.json package-lock.json ./
-    
-    # Install npm dependencies
-    RUN npm install
-    
-    # Copy existing application directory contents
-    COPY . .
-    
-    # Build assets for production (for Inertia/Vue)
-    RUN npm run build
-    
-    # Expose port 9000 and start php-fpm server
-    EXPOSE 9000
-    CMD ["php-fpm"]
-    
-    # Fix permissions for storage and bootstrap cache
-    RUN chown -R www-data:www-data /var/www/storage /var/www/bootstrap/cache
+        # ---- Stage 1: The "Builder" Stage ----
+        # This stage installs all tools, downloads dependencies, and builds assets.
+        FROM php:8.3-fpm AS builder
+        
+        WORKDIR /var/www
+        
+        # Install all necessary dependencies FOR BUILDING
+        RUN apt-get update && apt-get install -y --no-install-recommends \
+            git \
+            curl \
+            zip \
+            unzip \
+            libzip-dev \
+            libpng-dev \
+            libjpeg-dev \
+            libfreetype6-dev \
+            libonig-dev \
+            libwebp-dev \
+            && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+            && apt-get install -y nodejs \
+            && docker-php-ext-install pdo_mysql mbstring exif pcntl bcmath gd zip \
+            && curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer \
+            && apt-get clean && rm -rf /var/lib/apt/lists/*
+        
+        # Copy composer files and install PHP dependencies (production only)
+        COPY composer.json composer.lock ./
+        RUN composer install --no-dev --no-interaction --no-scripts --prefer-dist --optimize-autoloader
+        
+        # Copy package files, install dependencies, and build frontend assets
+        COPY package.json package-lock.json ./
+        RUN npm install
+        COPY . .
+        RUN npm run build
+        
+        
+        # ---- Stage 2: The Final "Production" Stage ----
+        # This stage is lean and only contains what's needed to RUN the app.
+        FROM php:8.3-fpm
+        
+        WORKDIR /var/www
+        
+        # Install only the required RUNTIME PHP extensions and system libraries
+        RUN apt-get update && apt-get install -y --no-install-recommends \
+            libzip-dev \
+            libpng-dev \
+            libjpeg-dev \
+            libfreetype6-dev \
+            libonig-dev \
+            libwebp-dev \
+            && docker-php-ext-install pdo_mysql mbstring exif pcntl bcmath gd zip \
+            && apt-get clean && rm -rf /var/lib/apt/lists/*
+        
+        # Copy the built application code and dependencies from the builder stage
+        COPY --from=builder /var/www .
+        
+        # Set correct permissions for the runtime user (www-data)
+        RUN mkdir -p /var/www/bootstrap/cache \
+            && mkdir -p /var/www/storage/framework/views \
+            && chown -R www-data:www-data /var/www/storage /var/www/bootstrap/cache \
+            && chmod -R 775 /var/www/storage /var/www/bootstrap/cache
+        
+        # Expose port 9000 and start the server
+        EXPOSE 9000
+        CMD ["php-fpm"]
+
     
     ```
 
