@@ -1,220 +1,298 @@
-Of course\! Deploying Laravel with Docker and using Caddy as a reverse proxy is a powerful and modern setup. Here's a step-by-step guide to get you up and running.
+Of course\! Deploying a Laravel application using Docker with Caddy as a reverse proxy is a powerful and modern setup. I'll guide you through the process, focusing on your specific requirements: a shared MariaDB container and support for multiple Laravel projects owned by a non-root user.
 
-This approach will create a shared database container and then a separate, self-contained environment for each of your Laravel applications.
+Here’s the complete plan:
+
+1.  **Set Up a Shared Docker Network and MariaDB:** Create a persistent, shared database container that all your Laravel apps can connect to.
+2.  **Dockerize a Laravel Application:** Create a `Dockerfile` and `docker-compose.yml` for a single Laravel project. This will serve as your template.
+3.  **Configure Caddy as a Reverse Proxy:** Point a domain to your Dockerized application.
+4.  **Deployment Workflow:** A step-by-step guide from `git clone` to a live site.
 
 -----
 
-### \#\# 1. Setting Up the Shared MariaDB Service  DATABASE
+### ✅ Prerequisite: User Permissions
 
-First, let's create a shared Docker network and launch the MariaDB container. This ensures all your Laravel applications can communicate with the same database instance securely.
+You mentioned that the `dit` user owns the project files. To allow `dit` to run Docker commands without using `sudo`, you need to add this user to the `docker` group.
 
-1.  **Create a Docker Network:** This network will be used by MariaDB and all your future Laravel app containers.
+Run this command as `root` (or with `sudo`):
+
+```bash
+sudo usermod -aG docker dit
+```
+
+**Important:** The user `dit` must **log out and log back in** for this change to take effect.
+
+-----
+
+### \#\# Step 1: Create the Shared MariaDB Service MariaDB
+
+First, we'll create a central MariaDB container. This setup will live in its own directory and use its own `docker-compose.yml`. This keeps it separate from your applications.
+
+1.  **Create a directory for the service:**
+    As the `root` user, create a directory to manage this shared service.
 
     ```bash
-    docker network create shared-services
+    mkdir -p /var/www/mariadb
+    cd /var/www/mariadb
     ```
 
-2.  **Create a Directory for MariaDB Data:** We need to store the database data on the host machine so it persists even if the container is removed.
+2.  **Create the `docker-compose.yml` file:**
+    Create a file named `docker-compose.yml` in this directory:
 
     ```bash
-    # Create a directory to hold all your docker volumes
-    sudo mkdir -p /opt/docker/mariadb/data
+    nano docker-compose.yml
     ```
 
-3.  **Create a `docker-compose.yml` for MariaDB:** In a convenient location (like `/opt/docker/mariadb/`), create a file named `docker-compose.yml`:
+    Paste the following configuration into the file:
 
     ```yaml
-    version: '3.8'
-
     services:
-      mariadb:
-        image: mariadb:11.2 # Using a specific version is good practice
-        container_name: global-mariadb
-        restart: unless-stopped
-        environment:
-          # IMPORTANT: Change these values!
-          MARIADB_ROOT_PASSWORD: 'your_strong_root_password'
-          MARIADB_DATABASE: 'your_first_laravel_db'
-          MARIADB_USER: 'your_laravel_user'
-          MARIADB_PASSWORD: 'your_strong_user_password'
-        volumes:
-          - ./data:/var/lib/mysql
+          mariadb:
+            image: mariadb:latest
+            container_name: mariadb
+            restart: always
+            environment:
+              MYSQL_ROOT_PASSWORD: N8xIyxIC9QFx
+            ports:
+              - "3306:3306"
+            volumes:
+              - ./mariadb-data:/var/lib/mysql
+            networks:
+              - shared-network
+        
         networks:
-          - shared-services
-        # DO NOT expose ports to the public internet unless you have a specific need.
-        # Containers on the same network can communicate directly.
-
-    networks:
-      shared-services:
-        external: true
+          shared-network:
+            external: true
     ```
 
-4.  **Launch MariaDB:** Navigate to the directory containing this `docker-compose.yml` file and run:
+3.  **Start the MariaDB container:**
+    From within the `/ver/www/mariadb` directory, run:
 
     ```bash
-    cd /opt/docker/mariadb
-    docker compose up -d
+    docker-compose up -d
     ```
 
-Your shared MariaDB database is now running\! You can connect to it from any other container attached to the `shared-services` network using the hostname **`global-mariadb`**.
+Now you have a MariaDB container running, and it has created a network called `shared-network`. All your future Laravel applications will connect to this network to communicate with the database using the hostname `mariadb`.
 
 -----
 
-### \#\# 2. Dockerizing Your Laravel Application 🚀
+### \#\# Step 2: Dockerize Your Laravel Application 🐳
 
-Now, for each Laravel project, you'll need to add a couple of files to "dockerize" it. Navigate to the root directory of one of your Laravel projects.
+Now, let's prepare a Laravel project to run in Docker. You will do these steps for **each** Laravel project you want to deploy.
 
-1.  **Create a `Dockerfile`:** This file defines the steps to build your application's image. It will use a multi-stage build to keep the final image lean, handling both the Node.js asset compilation and the PHP environment.
+Let's assume your project is located at `/home/dit/my-laravel-app`. Navigate there:
 
-    Create a file named `Dockerfile` in your Laravel project's root:
+```bash
+cd /home/dit/my-laravel-app
+```
+
+1.  **Create a `Dockerfile`:**
+    This file defines the environment for your PHP application. It will install PHP, extensions, Composer, and Node.js.
+
+    ```bash
+    nano Dockerfile
+    ```
+
+    Paste the following. This is a robust template that works for Laravel 10-12 with Node 22 and PHP 8.3.
 
     ```dockerfile
-        # Stage 1: Build Node.js assets
-        FROM node:22-alpine AS builder
-        WORKDIR /app
-        COPY package*.json ./
-        RUN npm install
-        COPY . .
-        # This command compiles your Vue/Inertia assets for production
-        RUN npm run build
-        
-        # Stage 2: Create the final PHP production image
-        FROM php:8.3-fpm-alpine AS final
-        WORKDIR /var/www/html
-        
-        # Install system dependencies
-        # ADDED freetype-dev, libjpeg-turbo-dev, and libpng-dev for the 'gd' extension
-        RUN apk add --no-cache \
-            libzip-dev \
-            zip \
-            oniguruma-dev \
-            libxml2-dev \
-            freetype-dev \
-            libjpeg-turbo-dev \
-            libpng-dev
-        
-        # Install common PHP extensions for Laravel
-        # Install common PHP extensions, removing all that are already built-in
-        RUN docker-php-ext-install \
-            pdo_mysql \
-            bcmath \
-            pcntl \
-            exif \
-            zip \
-            gd
-        
-        # ... the rest of your Dockerfile continues here
-        
-        # Install Composer
-        COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
-        
-        # Copy application code and compiled assets from the builder stage
-        COPY --from=builder /app /var/www/html
-        
-        # Create the cache directory and set permissions BEFORE running composer
-        RUN mkdir -p /var/www/html/bootstrap/cache \
-            && mkdir -p /var/www/html/storage/framework/views \
-            && chown -R www-data:www-data /var/www/html/storage /var/www/html/bootstrap/cache \
-            && chmod -R 775 /var/www/html/storage /var/www/html/bootstrap/cache
-        
-        # Install Composer dependencies
-        RUN composer install --no-interaction --optimize-autoloader --no-dev
-        
-        # Set correct permissions for storage (cache is already done)
-        RUN chown -R www-data:www-data /var/www/html/storage && \
-            chmod -R 775 /var/www/html/storage
-        
-        # Expose port 9000 for PHP-FPM
-        EXPOSE 9000
-        
-        # Start PHP-FPM
-        CMD ["php-fpm"]
-
+    
+    # Base PHP 8.3 FPM image
+    FROM php:8.3-fpm
+    
+    # Set working directory
+    WORKDIR /var/www
+    
+    # Install system dependencies
+    RUN apt-get update && apt-get install -y \
+        git \
+        curl \
+        libpng-dev \
+        libonig-dev \
+        libxml2-dev \
+        zip \
+        unzip \
+        libzip-dev \
+        libjpeg-dev \
+        libfreetype6-dev \
+        nodejs \
+        npm
+    
+    # Install PHP extensions required by Laravel
+    RUN docker-php-ext-install pdo_mysql mbstring exif pcntl bcmath gd zip
+    
+    # Clear cache
+    RUN apt-get clean && rm -rf /var/lib/apt/lists/*
+    
+    # Install Composer
+    COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
+    
+    # Install Node.js v22 (the default nodejs might be older)
+    RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+    RUN apt-get install -y nodejs
+    
+    
+    
+    # Copy composer.json and composer.lock
+    COPY composer.json composer.lock ./
+    
+    # Create the cache directory and set permissions BEFORE running composer
+    RUN mkdir -p /var/www/bootstrap/cache \
+        && mkdir -p /var/www/storage/framework/views \
+        && chown -R www-data:www-data /var/www/storage /var/www/bootstrap/cache \
+        && chmod -R 775 /var/www/storage /var/www/bootstrap/cache
+    
+    
+    # Install composer dependencies
+    RUN composer install --no-interaction --no-plugins --no-scripts --prefer-dist
+    
+    # Copy package.json and package-lock.json
+    COPY package.json package-lock.json ./
+    
+    # Install npm dependencies
+    RUN npm install
+    
+    # Copy existing application directory contents
+    COPY . .
+    
+    # Build assets for production (for Inertia/Vue)
+    RUN npm run build
+    
+    # Expose port 9000 and start php-fpm server
+    EXPOSE 9000
+    CMD ["php-fpm"]
+    
+    # Fix permissions for storage and bootstrap cache
+    RUN chown -R www-data:www-data /var/www/storage /var/www/bootstrap/cache
+    
     ```
 
-2.  **Create a `.dockerignore` file:** This prevents unnecessary files from being copied into your Docker image, making the build process faster and the image smaller.
+2.  **Create a Project-Specific `docker-compose.yml`:**
+    This file will define the services for *this specific application*: the PHP app itself and a webserver (Nginx) to serve it.
 
-    ```
-    .git
-    .github
-    .env
-    .env.example
-    node_modules
-    vendor
-    storage
-    public/storage
-    docker-compose.yml
-    Dockerfile
-    README.md
+    ```bash
+    nano docker-compose.yml
     ```
 
-3.  **Create a `docker-compose.yml` for the App:** This file will manage your application's service. Create a `docker-compose.yml` in the project root:
+    Paste this configuration:
 
     ```yaml
     version: '3.8'
 
     services:
+      # PHP-FPM Application Service
       app:
-        build: . # Tells Docker to build the Dockerfile in the current directory
-        container_name: my-first-app # Give each app a unique container name
+        build:
+          context: .
+          dockerfile: Dockerfile
+        container_name: my-laravel-app
         restart: unless-stopped
         volumes:
-          # Mount the .env file from the host into the container
-          - ./.env:/var/www/html/.env
+          - ./:/var/www
         networks:
-          - shared-services
-        # Map container's port 9000 to host's port 9001 (use a different host port for each app)
-        ports:
-          - "127.0.0.1:9001:9000"
+          - shared-network # Connect to the same network as MariaDB
 
+      # Nginx Webserver Service
+      webserver:
+        image: nginx:alpine
+        container_name: my-laravel-app-webserver
+        restart: unless-stopped
+        ports:
+          # Map a UNIQUE host port to the container's port 80
+          - "8001:80"
+        volumes:
+          - ./:/var/www
+          - ./docker/nginx/conf.d:/etc/nginx/conf.d/
+        networks:
+          - shared-network
+
+    # Define the external network
     networks:
-      shared-services:
+      shared-network:
         external: true
     ```
 
-    **Note:** For your second Laravel app, you would change `container_name` to `my-second-app` and the port mapping to `"127.0.0.1:9002:9000"`, and so on.
+    **Note:** For your next app, change the port from `"8001:80"` to `"8002:80"`, and so on. Each app needs a unique host port.
+
+3.  **Create the Nginx Configuration:**
+    Nginx will run in its own container and pass PHP requests to your `app` container.
+
+    ```bash
+    ```
+
+sh
+mkdir -p docker/nginx/conf.d
+nano docker/nginx/conf.d/app.conf
+\`\`\`
+Paste this standard Laravel Nginx config:
+
+````
+```nginx
+server {
+    listen 80;
+    index index.php index.html;
+    error_log  /var/log/nginx/error.log;
+    access_log /var/log/nginx/access.log;
+    root /var/www/public;
+
+    location ~ \.php$ {
+        try_files $uri =404;
+        fastcgi_split_path_info ^(.+\.php)(/.+)$;
+        fastcgi_pass app:9000; # 'app' is the name of our PHP service in docker-compose.yml
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param PATH_INFO $fastcgi_path_info;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+        gzip_static on;
+    }
+}
+```
+````
+
+4.  **Configure Your Laravel `.env` File:**
+    Make sure your project's `.env` file is configured to connect to the Docker database.
+    ```env
+    DB_CONNECTION=mysql
+    DB_HOST=mariadb # The container name of our MariaDB service
+    DB_PORT=3306
+    DB_DATABASE=your_app_database # Create this DB inside MariaDB
+    DB_USERNAME=your_db_user      # Create this user
+    DB_PASSWORD=your_db_password
+    ```
 
 -----
 
-### \#\# 3. Configuring Caddy as a Reverse Proxy 🔗
+### \#\# Step 3: Configure Caddy as Reverse Proxy 🔄
 
-Caddy, which is already installed on your host OS, will act as the web server. It will serve static files directly and forward PHP requests to the correct Docker container.
+Now, we'll tell Caddy (running on the host machine) to forward traffic from a domain to your new Docker container.
 
-1.  **Edit your `Caddyfile`:** This is typically located at `/etc/caddy/Caddyfile`.
+1.  **Edit your Caddyfile:**
+    As the `root` user, edit the main Caddy configuration file.
 
-2.  **Add a new site block for your application:**
+    ```bash
+    sudo nano /etc/caddy/Caddyfile
+    ```
+
+2.  **Add a new site block:**
+    Add the following block to the file. Caddy will automatically provision an SSL certificate for you.
 
     ```caddy
-    # Add this block for your first Laravel application
-    your-domain.com {
-        # Set the web root to your project's public directory on the host
-        root * /path/to/your/laravel/project/public
-
-        # Enable compression
-        encode zstd gzip
-
-        # Handle PHP requests by forwarding them to the app container's mapped port
-        # This points to localhost:9001, which we mapped in the app's docker-compose.yml
-        php_fastcgi 127.0.0.1:9001
-
-        # Serve static files directly
-        file_server
-
-        # Rewrite all other requests to index.php for Laravel's front-controller
-        try_files {path} {path}/ /index.php?{query}
+    yourapp.yourdomain.com {
+        # Reverse proxy requests to the Nginx container's exposed port
+        reverse_proxy localhost:8001
     }
 
-    # For a second application, you would add another block:
-    # another-domain.com {
-    #     root * /path/to/your/second/laravel/project/public
-    #     php_fastcgi 127.0.0.1:9002 # Points to the second app's mapped port
-    #     # ... same file_server and try_files config
+    # If you deploy a second app on port 8002, you would add:
+    # anotherapp.yourdomain.com {
+    #     reverse_proxy localhost:8002
     # }
     ```
 
-    Caddy will automatically handle provisioning and renewing SSL certificates for `your-domain.com`.
-
-3.  **Reload Caddy:** After saving your `Caddyfile`, apply the changes.
+3.  **Reload Caddy:**
+    After saving the file, apply the changes by reloading Caddy.
 
     ```bash
     sudo systemctl reload caddy
@@ -222,55 +300,34 @@ Caddy, which is already installed on your host OS, will act as the web server. I
 
 -----
 
-### \#\# 4. Deployment Workflow Summary ✅
+### \#\# 🚀 To run php artisan command
+```docker compose exec app php artisan [command]```
 
-Here is the complete workflow to deploy a new Laravel application:
+### ## Your Deployment Checklist ✅
 
-1.  **Clone Your Project:** Clone your Laravel application from your git repository onto your VPS (e.g., into `/var/www/my-first-app`).
+Think of it as a standard step in your deployment process for any new Laravel app. Your workflow will look like this:
 
-    ```bash
-    cd /var/www
-    git clone your-repository-url.git my-first-app
-    cd my-first-app
-    ```
+1.  `git clone <new-project-repo>`
+2.  `cd <new-project-directory>`
+3.  Set up your `.env` file and Docker files (`Dockerfile`, `docker-compose.yml`, etc.).
+4.  Run `docker compose up -d --build` to start the containers.
+5.  Run `docker compose exec app composer install` to create the `vendor` directory.
+6.  **Run `sudo chown -R www-data:www-data storage bootstrap/cache` to fix permissions.**
+7.  Run any other necessary commands like `docker compose exec app php artisan migrate`, `docker compose exec app php artisan key:generate`, etc.
+8.  Configure Caddy to point to the new app's port.
 
-2.  **Add Docker Files:** Add the `Dockerfile`, `.dockerignore`, and `docker-compose.yml` files as described in Step 2.
+### \#\# 🚀 Full Deployment Workflow Summary
 
-3.  **Configure `.env` file:** Copy `.env.example` to `.env` and configure it for production.
+Here is the complete process for a new app, performed as the `dit` user (except for the Caddy steps):
 
-    ```bash
-    cp .env.example .env
-    nano .env
-    ```
+1.  **Clone Project:** `git clone <your-repo-url> my-new-app`
+2.  **Navigate to Project:** `cd my-new-app`
+3.  **Add Docker Files:** Create the `Dockerfile`, `docker-compose.yml`, and the `docker/nginx/conf.d/app.conf` files as shown in Step 2. Remember to pick a **unique host port** in `docker-compose.yml`.
+4.  **Configure Environment:** Copy `.env.example` to `.env` and fill in your database credentials and other app settings.
+5.  **Build and Start Containers:** `docker-compose up -d --build`
+6.  **Run Database Migrations:** `docker-compose exec app php artisan migrate --seed`
+7.  **Configure Caddy (as root):** Edit `/etc/caddy/Caddyfile` to add the new domain and `reverse_proxy` directive pointing to the unique port you chose.
+8.  **Reload Caddy (as root):** `sudo systemctl reload caddy`
 
-    **Most importantly**, set your database connection details:
+Your application is now live\! You can repeat this process for all your Laravel applications, ensuring each one uses a different host port for its `webserver` service.
 
-    ```env
-    DB_CONNECTION=mysql
-    DB_HOST=global-mariadb  # <-- Use the container name
-    DB_PORT=3306
-    DB_DATABASE=your_first_laravel_db # The DB you created in Step 1
-    DB_USERNAME=your_laravel_user   # The user you created in Step 1
-    DB_PASSWORD=your_strong_user_password # The password you set in Step 1
-    ```
-
-4.  **Build and Run the Container:**
-
-    ```bash
-    docker compose up -d --build
-    ```
-
-5.  **Run Final Commands:** Execute database migrations and other necessary Artisan commands inside the container.
-
-    ```bash
-    docker compose exec --user root app php artisan key:generate
-    docker compose exec --user root app php artisan storage:link
-    docker compose exec --user root app php artisan migrate --seed # optional
-    docker compose exec --user root app php artisan config:cache
-    docker compose exec --user root app php artisan route:cache
-    docker compose exec --user root app php artisan view:cache
-    ```
-
-6.  **Configure and Reload Caddy:** Add the site block to your `Caddyfile` and reload the Caddy service as shown in Step 3.
-
-That's it\! Your Laravel application is now running in Docker, served securely by Caddy. You can repeat steps 2 through 4 for each additional Laravel application you want to deploy.
