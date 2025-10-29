@@ -161,6 +161,7 @@ cd /home/dit/my-laravel-app
         EXPOSE 9000
         CMD ["php-fpm"]
 
+
     
     ```
 
